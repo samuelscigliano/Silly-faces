@@ -45,6 +45,8 @@ svg{display:block}
 #busy{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(255,255,255,.95);color:var(--ink);
   border-radius:999px;padding:12px 20px 12px 14px;font-weight:600;font-size:17px;display:flex;align-items:center;gap:10px;z-index:5;
   box-shadow:0 8px 24px rgba(0,0,0,.3)}
+#busy.fail{max-width:86vw;border-radius:24px;text-align:center;padding:14px 20px}
+#busy.fail .spin{display:none}
 .spin{width:24px;height:24px;border-radius:50%;border:4px solid var(--sun);border-top-color:var(--pink);animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
@@ -187,7 +189,7 @@ svg{display:block}
       <div class="ph-title">Snap a selfie!</div>
       <div class="ph-sub">Tap the big button to take a photo, then try all the silly filters on it.</div>
     </div>
-    <div id="busy" hidden><div class="spin"></div><span>Warming up the silly machine…</span></div>
+    <div id="busy" hidden><div class="spin"></div><span id="busyText">Warming up the silly machine…</span></div>
     <div id="count"></div>
     <div id="flash"></div>
   </div>
@@ -944,7 +946,7 @@ function drawScene(t, dt) {
   if (F.after) { ctx.save(); F.after(t, dt); ctx.restore(); }
 }
 
-let lastNow = 0, busy = false, lastVT = -1, lastSend = 0, detectFails = 0;
+let lastNow = 0, busy = false, lastVT = -1, lastSend = 0, detectFails = 0, noFaceSince = 0, lastNoFaceTip = 0;
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = lastNow ? clamp((now - lastNow) / 1000, 0, 0.05) : 0.016;
@@ -953,16 +955,27 @@ function frame(now) {
     if (V.src !== video || V.sw !== video.videoWidth || V.sh !== video.videoHeight) {
       V.src = video; V.sw = video.videoWidth; V.sh = video.videoHeight; layout();
     }
-    if (fm && modelReady && !busy && (video.currentTime !== lastVT || now - lastSend > 120) && detectFails < 20) {
+    if (engine && !busy && (video.currentTime !== lastVT || now - lastSend > 120) && detectFails < 40) {
       lastVT = video.currentTime; lastSend = now; busy = true;
-      fm.send({ image: video }).then(() => { detectFails = 0; }).catch(e => { detectFails++; console.warn(e); }).then(() => { busy = false; });
+      Promise.resolve().then(() => engine.video(video, now))
+        .then(lists => { detectFails = 0; processLive(lists || []); })
+        .catch(e => { detectFails++; lastErr = errText(e); console.warn(e); if (detectFails === 5 && engine.fallback) return engine.fallback(); })
+        .then(() => { busy = false; });
+    }
+    // friendly hint if no face has been seen for a while
+    if (engine) {
+      if (tracks.length) noFaceSince = 0; else if (!noFaceSince) noFaceSince = now;
+      if (noFaceSince && now - noFaceSince > 6000 && now - lastNoFaceTip > 20000 && !counting) {
+        lastNoFaceTip = now; toast("I can't see a face yet! Try more light 💡", 3000);
+      }
     }
   }
   drawScene(now / 1000, dt);
 }
 
 /* ---------- face model ---------- */
-let fm = null, modelReady = false, modelFailed = false, pendingPhoto = null;
+let engine = null, modelReady = false, modelFailed = false, lastErr = '';
+const errText = e => String((e && (e.message || e.name)) || e).slice(0, 140);
 function loadScript(src) {
   return new Promise((res, rej) => {
     const s = document.createElement('script'); s.src = src; s.crossOrigin = 'anonymous';
@@ -975,18 +988,12 @@ function toArr(lm) {
   for (let i = 0; i < lm.length; i++) { a[i * 2] = lm[i].x; a[i * 2 + 1] = lm[i].y; }
   return a;
 }
-function onResults(res) {
-  const lists = (res && res.multiFaceLandmarks) || [];
-  const now = performance.now();
-  if (pendingPhoto) {
-    tracks = lists.filter(l => l.length >= 478).map(lm => ({ pts: toArr(lm), st: {}, seen: now }));
-    const p = pendingPhoto; pendingPhoto = null; p(tracks.length);
-    return;
-  }
+function processLive(lists) {
   if (mode !== 'live') return;
+  const now = performance.now();
   const sw = V.sw || 1, sh = V.sh || 1, used = new Set(), next = [];
   for (const lm of lists) {
-    if (lm.length < 478) continue;
+    if (!lm || lm.length < 478) continue;
     const pts = toArr(lm);
     const nx = pts[2] * sw, ny = pts[3] * sh;
     const fw = Math.hypot((pts[908] - pts[468]) * sw, (pts[909] - pts[469]) * sh) || 1;
@@ -1005,6 +1012,58 @@ function onResults(res) {
   }
   for (const tr of tracks) if (!used.has(tr) && now - tr.seen < 300) next.push(tr);
   tracks = next;
+}
+
+// Google's current face tracker (MediaPipe Tasks), loaded from the web.
+const TASKS_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3';
+const FACE_MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+async function loadTasksEngine() {
+  const vision = await import(TASKS_BASE + '/vision_bundle.mjs');
+  const fileset = await vision.FilesetResolver.forVisionTasks(TASKS_BASE + '/wasm');
+  const make = (delegate, runningMode) => vision.FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate },
+    runningMode, numFaces: 3,
+    minFaceDetectionConfidence: 0.5, minFacePresenceConfidence: 0.5, minTrackingConfidence: 0.5
+  });
+  let delegate = 'GPU', lm;
+  try { lm = await make('GPU', 'VIDEO'); } catch (e) { delegate = 'CPU'; lm = await make('CPU', 'VIDEO'); }
+  let runMode = 'VIDEO', lastTs = 0;
+  const setMode = async m => { if (runMode !== m) { await lm.setOptions({ runningMode: m }); runMode = m; } };
+  return {
+    get detail() { return 'tasks-' + delegate; },
+    async video(v, now) {
+      await setMode('VIDEO');
+      const ts = Math.max(Math.round(now), lastTs + 1); lastTs = ts;
+      return lm.detectForVideo(v, ts).faceLandmarks;
+    },
+    async image(c) { await setMode('IMAGE'); return lm.detect(c).faceLandmarks; },
+    reset() {},
+    async fallback() {  // if the graphics chip keeps failing, switch to the slower but safer CPU mode
+      if (delegate === 'CPU') return;
+      try { const old = lm; lm = await make('CPU', runMode); delegate = 'CPU'; detectFails = 0; try { old.close(); } catch (e) {} }
+      catch (e) { lastErr = errText(e); }
+    }
+  };
+}
+// The older MediaPipe face mesh (used inside Claude, and as a backup on the web).
+async function loadLegacyEngine(locate) {
+  const fm = new window.FaceMesh({ locateFile: locate });
+  fm.setOptions({ maxNumFaces: 3, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5, selfieMode: false });
+  let waiting = null;
+  fm.onResults(res => { const w = waiting; waiting = null; if (w) w((res && res.multiFaceLandmarks) || []); });
+  await fm.initialize();
+  const run = img => new Promise((resolve, reject) => {
+    waiting = resolve;
+    fm.send({ image: img })
+      .then(() => { if (waiting === resolve) { waiting = null; resolve([]); } })
+      .catch(e => { if (waiting === resolve) waiting = null; reject(e); });
+  });
+  return {
+    detail: 'legacy',
+    video: v => run(v),
+    image: c => { try { fm.reset(); } catch (e) {} return run(c); },
+    reset() { try { fm.reset(); } catch (e) {} }
+  };
 }
 // Serve the two model files that ship as text (mp/fm_assets.js) from memory instead of the network.
 function installMemFiles(b64) {
@@ -1041,38 +1100,46 @@ function installMemFiles(b64) {
 }
 const MEM_NAMES = ['face_mesh.binarypb', 'face_mesh_solution_packed_assets.data'];
 const modelPromise = (async () => {
-  let locate = null;
-  try {
-    await loadScript(LOCAL_MP + 'face_mesh.js');
-    await loadScript(LOCAL_MP + 'fm_assets.js');
-    if (window.FaceMesh && window.__FM_FILES && MEM_NAMES.every(n => window.__FM_FILES[n])) {
-      installMemFiles(window.__FM_FILES); window.__FM_FILES = null;
-      locate = file => LOCAL_MP + (MEM_NAMES.includes(file) ? '__mem__/' : '') + file;
-    }
-  } catch (e) {}
-  if (!locate) {
-    if (!window.FaceMesh) await loadScript(CDN_MP + 'face_mesh.js');
-    locate = file => CDN_MP + file;
+  // 1) Inside Claude: use the face tracker files that ship next to this page.
+  let local = false;
+  try { await loadScript(LOCAL_MP + 'face_mesh.js'); local = !!window.FaceMesh; } catch (e) {}
+  if (local) {
+    try {
+      await loadScript(LOCAL_MP + 'fm_assets.js');
+      if (window.__FM_FILES && MEM_NAMES.every(n => window.__FM_FILES[n])) {
+        installMemFiles(window.__FM_FILES); window.__FM_FILES = null;
+        engine = await loadLegacyEngine(file => LOCAL_MP + (MEM_NAMES.includes(file) ? '__mem__/' : '') + file);
+        return;
+      }
+    } catch (e) { lastErr = errText(e); }
   }
-  fm = new window.FaceMesh({ locateFile: locate });
-  fm.setOptions({ maxNumFaces: 3, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5, selfieMode: false });
-  fm.onResults(onResults);
-  await fm.initialize();
-  modelReady = true;
+  // 2) On the web: Google's current face tracker.
+  try { engine = await loadTasksEngine(); return; } catch (e) { lastErr = errText(e); console.warn('tasks engine', e); }
+  // 3) Backup: the older face tracker from the web.
+  if (!window.FaceMesh) await loadScript(CDN_MP + 'face_mesh.js');
+  engine = await loadLegacyEngine(file => CDN_MP + file);
 })();
 modelPromise.then(() => {
+  modelReady = true;
   $('#status').textContent = 'Ready! ✨';
   updateBusy();
 }).catch(e => {
   console.error(e);
+  modelFailed = true; lastErr = errText(e);
   $('#status').textContent = 'Uh oh, the filters could not load. Check the internet and reload.';
   updateBusy();
-  if (mode !== 'splash') toast('Uh oh! The filters could not load 😢');
 });
 function updateBusy() {
-  $('#busy').hidden = modelReady || mode === 'splash' || (mode === 'photo' && !V.src) || modelFailed;
+  const b = $('#busy');
+  if (modelFailed && mode !== 'splash' && mode !== 'starting') {
+    b.hidden = false; b.classList.add('fail');
+    $('#busyText').textContent = "Oops! The filters couldn't load. Check the internet, then reload the page.";
+    return;
+  }
+  b.classList.remove('fail');
+  $('#busyText').textContent = 'Warming up the silly machine…';
+  b.hidden = modelReady || mode === 'splash' || mode === 'starting' || (mode === 'photo' && !V.src);
 }
-modelPromise.catch(() => { modelFailed = true; updateBusy(); });
 
 /* ---------- camera / photo modes ---------- */
 function stopStream() { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
@@ -1086,7 +1153,7 @@ async function startCamera() {
     video.srcObject = stream;
     try { await video.play(); } catch (e) {}
     mode = 'live'; V.mirror = facing === 'user'; V.src = null; V.sw = 0;
-    tracks = []; try { fm && fm.reset(); } catch (e) {}
+    tracks = []; try { engine && engine.reset(); } catch (e) {}
     $('#placeholder').hidden = true;
     layout(); updateControls(); updateBusy();
   } catch (e) {
@@ -1125,13 +1192,13 @@ function setPhotoSource(c) {
 }
 async function detectPhoto(c) {
   if (!modelReady) { try { await modelPromise; } catch (e) { return; } }
-  try { fm.reset(); } catch (e) {}
-  const n = await new Promise(resolve => {
-    pendingPhoto = resolve;
-    fm.send({ image: c }).catch(() => { if (pendingPhoto) { pendingPhoto = null; resolve(0); } });
-  });
+  let lists = [];
+  try { lists = (await engine.image(c)) || []; } catch (e) { lastErr = errText(e); console.warn(e); }
+  if (V.src !== c) return;
+  const now = performance.now();
+  tracks = lists.filter(l => l && l.length >= 478).map(lm => ({ pts: toArr(lm), st: {}, seen: now }));
   updateBusy();
-  if (V.src === c && !n) toast("Hmm, I can't find a face! 🙈 Try again.");
+  if (!tracks.length) toast("Hmm, I can't find a face! 🙈 Try again.");
 }
 
 function renderPhotoBlob() {
@@ -1348,6 +1415,15 @@ $('#goBtn').addEventListener('click', async () => {
   await startCamera();
 });
 $('#shutter').addEventListener('click', shoot);
+// grown-up helper: tap the logo 3 times quickly to see what the face tracker is doing
+let logoTaps = [];
+$('.logo').addEventListener('click', () => {
+  const t = performance.now(); logoTaps = logoTaps.filter(x => t - x < 1500); logoTaps.push(t);
+  if (logoTaps.length < 3) return;
+  logoTaps = [];
+  toast('🔧 ' + (engine ? engine.detail : (modelFailed ? 'tracker failed' : 'tracker loading')) + ' · faces ' + tracks.length +
+    ' · cam ' + (video.videoWidth || 0) + 'x' + (video.videoHeight || 0) + (lastErr ? ' · ' + lastErr : ''), 7000);
+});
 $('#rightBtn').addEventListener('click', () => {
   initAudio();
   if (mode === 'live') { facing = facing === 'user' ? 'environment' : 'user'; sfx.whoosh(); startCamera(); }
@@ -1404,7 +1480,7 @@ document.addEventListener('visibilitychange', () => {
 window.__sillyTest = {
   show(canvas, lists) { setPhotoSource(canvas); tracks = lists.map(l => ({ pts: Float32Array.from(l), st: {}, seen: performance.now() })); },
   setFilter: i => setFilter(i, true),
-  status: () => ({ mode, modelReady, modelFailed, faces: tracks.length, photos: photos.length, filters: FILTERS.length })
+  status: () => ({ mode, modelReady, modelFailed, engine: engine && engine.detail, lastErr, faces: tracks.length, photos: photos.length, filters: FILTERS.length })
 };
 
 paintSound();
