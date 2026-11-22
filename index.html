@@ -1742,9 +1742,213 @@ function iceCream(f, st, t) {
   });
 }
 
+/* ---------- face warping (WebGL): reshapes the real camera picture ---------- */
+const MAX_WARPS = 24, W_SCALE = 0, W_SHIFT = 1, W_SWIRL = 2;
+const warpGL = { tried: false, ok: false };
+function initWarp() {
+  warpGL.tried = true;
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl', { alpha: false, antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: false });
+    if (!gl) return;
+    const vsrc = 'attribute vec2 a_pos;varying vec2 v_uv;void main(){v_uv=vec2(a_pos.x*0.5+0.5,0.5-a_pos.y*0.5);gl_Position=vec4(a_pos,0.0,1.0);}';
+    const fsrc = [
+      'precision highp float;',
+      'uniform sampler2D u_tex;uniform vec2 u_res;uniform vec4 u_src;uniform float u_mirror;uniform int u_n;',
+      'uniform vec4 u_a[' + MAX_WARPS + '];uniform vec4 u_b[' + MAX_WARPS + '];varying vec2 v_uv;',
+      'void main(){',
+      '  vec2 q=v_uv*u_res;',
+      '  for(int i=0;i<' + MAX_WARPS + ';i++){',
+      '    if(i>=u_n)break;',
+      '    vec4 a=u_a[i];vec4 b=u_b[i];vec2 d=q-a.xy;float t=length(d)/a.z;',
+      '    if(t<1.0){',
+      '      float f=1.0-t*t;f=f*f;',
+      '      if(a.w<0.5){float c=cos(b.z),s=sin(b.z);vec2 l=vec2(c*d.x+s*d.y,-s*d.x+c*d.y);l*=mix(vec2(1.0),b.xy,f);q=a.xy+vec2(c*l.x-s*l.y,s*l.x+c*l.y);}',
+      '      else if(a.w<1.5){q-=b.xy*f;}',
+      '      else{float g=b.x*f;float c=cos(g),s=sin(g);q=a.xy+vec2(c*d.x-s*d.y,s*d.x+c*d.y);}',
+      '    }',
+      '  }',
+      '  float x=q.x;if(u_mirror>0.5)x=u_res.x-x;',
+      '  vec2 uv=vec2((x-u_src.x)/u_src.z,(q.y-u_src.y)/u_src.w);',
+      '  gl_FragColor=texture2D(u_tex,clamp(uv,0.0,1.0));',
+      '}'].join('\n');
+    const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, vsrc)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fsrc));
+    gl.linkProgram(prog); if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const ap = gl.getAttribLocation(prog, 'a_pos'); gl.enableVertexAttribArray(ap); gl.vertexAttribPointer(ap, 2, gl.FLOAT, false, 0, 0);
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    const U = n => gl.getUniformLocation(prog, n);
+    Object.assign(warpGL, { gl, c, prog, tex, A: new Float32Array(MAX_WARPS * 4), B: new Float32Array(MAX_WARPS * 4),
+      u: { tex: U('u_tex'), res: U('u_res'), src: U('u_src'), mirror: U('u_mirror'), n: U('u_n'), a: U('u_a'), b: U('u_b') } });
+    gl.uniform1i(warpGL.u.tex, 0);
+    c.addEventListener('webglcontextlost', e => { e.preventDefault(); warpGL.ok = false; });
+    warpGL.ok = true;
+  } catch (e) { console.warn('warp', e); warpGL.ok = false; }
+}
+// draws the source picture with the warps applied; returns false if it couldn't
+function drawWarped(list) {
+  if (!warpGL.tried) initWarp();
+  if (!warpGL.ok) return false;
+  try {
+    const { gl, c, u, A, B } = warpGL, d = V.dpr;
+    const w = Math.max(1, Math.round(V.W * d)), h = Math.max(1, Math.round(V.H * d));
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    gl.viewport(0, 0, w, h);
+    gl.bindTexture(gl.TEXTURE_2D, warpGL.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, V.src);
+    A.fill(0); B.fill(0);
+    list.forEach((w8, i) => {
+      const [type, cx, cy, r, p0, p1, p2] = w8;
+      A[i * 4] = cx * d; A[i * 4 + 1] = cy * d; A[i * 4 + 2] = Math.max(1, r * d); A[i * 4 + 3] = type;
+      if (type === W_SHIFT) { B[i * 4] = p0 * d; B[i * 4 + 1] = p1 * d; }
+      else { B[i * 4] = p0; B[i * 4 + 1] = p1; B[i * 4 + 2] = p2; }
+    });
+    gl.uniform2f(u.res, w, h);
+    gl.uniform4f(u.src, V.dx * d, V.dy * d, V.dw * d, V.dh * d);
+    gl.uniform1f(u.mirror, V.mirror ? 1 : 0);
+    gl.uniform1i(u.n, list.length);
+    gl.uniform4fv(u.a, A); gl.uniform4fv(u.b, B);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    ctx.drawImage(c, 0, 0, V.W, V.H);
+    return true;
+  } catch (e) { console.warn('warp draw', e); warpGL.ok = false; return false; }
+}
+// rough stand-in when WebGL isn't available: magnify the "grow" warps only
+function approxWarps(list) {
+  for (const [type, cx, cy, r, sx, sy] of list) if (type === W_SCALE && sx < 0.95) magnify(cx, cy, r * 0.75, clamp(1 / sx, 1, 2), clamp(1 / sy, 1, 2));
+}
+const vecL = (f, lx, ly) => f.at({ x: 0, y: 0 }, lx, ly);
+// sx/sy below 1 = make bigger, above 1 = make smaller (along the face's own left-right / up-down)
+function wScale(add, f, c, r, sx, sy = sx) { add(W_SCALE, c, r * f.s, sx, sy, f.angle); }
+function wShift(add, f, c, r, lx, ly) { const v = vecL(f, lx, ly); add(W_SHIFT, c, r * f.s, v.x, v.y); }
+function wSwirl(add, f, c, r, angle) { add(W_SWIRL, c, r * f.s, angle); }
+
+/* face changers */
+const wBugEyes = (f, add) => { for (const i of [468, 473]) wScale(add, f, f.P(i), 0.22, 0.42); };
+const wTinyEyes = (f, add) => { for (const i of [468, 473]) wScale(add, f, f.P(i), 0.15, 1.9); };
+const wBigNose = (f, add) => wScale(add, f, f.at(f.nose, 0, -0.03), 0.26, 0.4);
+const wLongNose = (f, add) => { wScale(add, f, f.at(f.nose, 0, 0.01), 0.17, 0.75); wShift(add, f, f.at(f.nose, 0, 0.02), 0.22, 0, 0.17); };
+const wTinyFace = (f, add) => wScale(add, f, f.at(f.nose, 0, -0.03), 0.85, 1.8);
+const wBigHead = (f, add) => wScale(add, f, f.at(f.nose, 0, -0.08), 1.0, 0.62);
+const wBigMouth = (f, add) => wScale(add, f, f.mouth, 0.32, 0.5);
+const wTinyMouth = (f, add) => wScale(add, f, f.mouth, 0.24, 2.2);
+const wStretchy = (f, add) => wScale(add, f, f.at(f.nose, 0, -0.03), 0.95, 1.0, 0.6);
+const wSquishy = (f, add) => wScale(add, f, f.nose, 0.9, 0.6, 1.08);
+const wSwirlFace = (f, add, t) => wSwirl(add, f, f.at(f.nose, 0, -0.02), 0.75, 2.4 * Math.sin(t * 1.4));
+const wEggHead = (f, add) => wShift(add, f, f.at(f.P(10), 0, 0.12), 0.58, 0, -0.32);
+const wLongChin = (f, add) => wShift(add, f, f.at(f.P(152), 0, -0.02), 0.5, 0, 0.32);
+const wChipmunk = (f, add) => { for (const i of [50, 280]) { const side = f.lx(f.P(i)) < 0 ? -1 : 1; wScale(add, f, f.at(f.P(i), side * 0.1, 0.07), 0.3, 0.5); } };
+function wBigSmile(f, add) {
+  const [ml, mr] = lr(f, 61, 291);
+  wShift(add, f, ml, 0.15, -0.06, -0.09); wShift(add, f, mr, 0.15, 0.06, -0.09);
+  const [cl, cr] = lr(f, 50, 280);
+  wShift(add, f, cl, 0.16, 0, -0.035); wShift(add, f, cr, 0.16, 0, -0.035);
+}
+function wGrumpy(f, add) {
+  const [ml, mr] = lr(f, 61, 291);
+  wShift(add, f, ml, 0.13, -0.01, 0.075); wShift(add, f, mr, 0.13, 0.01, 0.075);
+  const [bl, br] = lr(f, 107, 336);
+  wShift(add, f, bl, 0.12, 0.02, 0.055); wShift(add, f, br, 0.12, -0.02, 0.055);
+}
+function wShocked(f, add) {
+  for (const i of [468, 473]) wScale(add, f, f.P(i), 0.18, 0.62);
+  const [bl, br] = lr(f, 105, 334);
+  wShift(add, f, bl, 0.17, 0, -0.08); wShift(add, f, br, 0.17, 0, -0.08);
+  wScale(add, f, f.mouth, 0.28, 1.15, 0.55);
+}
+function wCrossEyed(f, add) {
+  const [eL, eR] = lr(f, 468, 473);
+  wShift(add, f, eL, 0.09, 0.045, 0); wShift(add, f, eR, 0.09, -0.045, 0);
+}
+function wFishy(f, add) {
+  for (const i of [50, 280]) { const side = f.lx(f.P(i)) < 0 ? -1 : 1; wScale(add, f, f.at(f.P(i), side * 0.04, 0.03), 0.22, 1.6); }
+  wScale(add, f, f.mouth, 0.24, 1.55, 0.8);
+  for (const i of [468, 473]) wScale(add, f, f.P(i), 0.17, 0.72);
+}
+function wJelly(f, add, t) {
+  [[0, -0.4], [-0.3, 0.05], [0.3, 0.05], [0, 0.4], [0, -0.05]].forEach(([x, y], k) =>
+    wShift(add, f, f.at(f.nose, x, y), 0.36, Math.sin(t * 9 + k * 1.7) * 0.05, Math.cos(t * 8 + k * 2.3) * 0.05));
+}
+
+/* skin colour changers */
+function rainbowSkin(f, st, t) {
+  ctx.save(); ovalPath(f);
+  const a = f.at(f.nose, -0.6, -0.4), b = f.at(f.nose, 0.6, 0.4);
+  const g = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+  for (let k = 0; k <= 6; k++) g.addColorStop(k / 6, 'hsl(' + ((k * 60 + t * 90) % 360) + ',95%,55%)');
+  ctx.globalCompositeOperation = 'color'; ctx.globalAlpha = 0.8; ctx.fillStyle = g; ctx.fill();
+  ctx.restore();
+  sparkles(f, [[-0.55, -0.1, 0.05], [0.55, -0.2, 0.05], [0.4, -0.5, 0.04]], t, ['#ffffff', '#fff3a6']);
+}
+function goldStatue(f, st, t) {
+  ctx.save(); ovalPath(f);
+  ctx.globalCompositeOperation = 'color'; ctx.fillStyle = 'rgba(226,170,20,.95)'; ctx.fill();
+  ctx.globalCompositeOperation = 'soft-light';
+  const a = f.at(f.nose, -0.4, -0.5), b = f.at(f.nose, 0.4, 0.5);
+  const g = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+  g.addColorStop(0, 'rgba(255,255,255,.9)'); g.addColorStop(0.5, 'rgba(255,220,120,.3)'); g.addColorStop(1, 'rgba(90,50,0,.6)');
+  ctx.fillStyle = g; ctx.fill();
+  ctx.restore();
+  sparkles(f, [[-0.45, 0.1, 0.06], [0.4, -0.05, 0.07], [0.15, -0.35, 0.05], [-0.25, 0.55, 0.05], [0.3, 0.6, 0.05]], t, ['#ffffff', '#fff3a6']);
+}
+function ghostAt(x, y, sz, t, s) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.beginPath(); ctx.moveTo(-sz, 0); ctx.arc(0, 0, sz, PI, 0);
+  ctx.lineTo(sz, sz * 1.1);
+  for (let k = 0; k < 4; k++) { const x0 = sz - (k + 0.5) * sz / 2; ctx.quadraticCurveTo(x0, sz * (1.1 + (k % 2 ? 0.25 : -0.05) + 0.08 * Math.sin(t * 6 + k)), sz - (k + 1) * sz / 2, sz * 1.1); }
+  ctx.closePath(); ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.fill(); ink(s, 0.008); ctx.stroke();
+  ctx.fillStyle = '#2a1458';
+  ctx.beginPath(); ctx.ellipse(-sz * 0.35, -sz * 0.05, sz * 0.13, sz * 0.2, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(sz * 0.35, -sz * 0.05, sz * 0.13, sz * 0.2, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0, sz * 0.4, sz * 0.12, sz * 0.16, 0, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function ghost(f, st, t) {
+  ctx.save(); ovalPath(f);
+  ctx.globalCompositeOperation = 'saturation'; ctx.fillStyle = '#808080'; ctx.fill();
+  ctx.globalCompositeOperation = 'screen'; ctx.fillStyle = 'rgba(190,215,255,.5)'; ctx.fill();
+  ctx.restore();
+  L(f, f.at(f.nose, 0, -0.1), s => {
+    for (const k of [0, 1]) {
+      const a = t * (0.8 + k * 0.35) + k * 2.5;
+      ghostAt(Math.cos(a) * 0.75 * s, Math.sin(a * 1.2) * 0.4 * s - 0.1 * s, 0.09 * s, t, s);
+    }
+  });
+}
+
 const FILTERS = [
   { name: 'No Filter', icon: '🙂' },
   { name: 'Puppy', icon: '🐶', hint: 'Open your mouth!', draw: puppy },
+  { name: 'Bug Eyes', icon: '🥺', warp: wBugEyes },
+  { name: 'Big Head', icon: '🤯', warp: wBigHead },
+  { name: 'Tiny Face', icon: '🤏', warp: wTinyFace },
+  { name: 'Swirl', icon: '🌀', hint: 'Dizzy!', warp: wSwirlFace },
+  { name: 'Jelly Face', icon: '🍮', hint: 'Wobble wobble!', warp: wJelly },
+  { name: 'Big Nose', icon: '👃', warp: wBigNose },
+  { name: 'Long Nose', icon: '🥕', warp: wLongNose },
+  { name: 'Big Mouth', icon: '👄', hint: 'Say ahhh!', warp: wBigMouth },
+  { name: 'Tiny Mouth', icon: '😗', warp: wTinyMouth },
+  { name: 'Tiny Eyes', icon: '😑', warp: wTinyEyes },
+  { name: 'Cross-Eyed', icon: '😵', warp: wCrossEyed },
+  { name: 'Big Smile', icon: '😁', warp: wBigSmile },
+  { name: 'Grumpy', icon: '😠', warp: wGrumpy },
+  { name: 'Shocked', icon: '😱', warp: wShocked },
+  { name: 'Chipmunk', icon: '🐿️', warp: wChipmunk },
+  { name: 'Fishy', icon: '🐟', hint: 'Blub blub!', warp: wFishy },
+  { name: 'Egg Head', icon: '🥚', warp: wEggHead },
+  { name: 'Long Chin', icon: '🌙', warp: wLongChin },
+  { name: 'Stretchy', icon: '😮', warp: wStretchy },
+  { name: 'Squishy', icon: '😆', warp: wSquishy },
+  { name: 'Rainbow Skin', icon: '🎨', draw: rainbowSkin },
+  { name: 'Gold Statue', icon: '🏆', hint: 'Hold still!', draw: goldStatue },
+  { name: 'Ghost', icon: '👻', hint: 'Boo!', draw: ghost },
   { name: 'Kitty', icon: '🐱', draw: kitty },
   { name: 'Bunny', icon: '🐰', hint: 'Shake your head!', draw: bunny },
   { name: 'Piggy', icon: '🐷', hint: 'Oink oink!', draw: pig },
@@ -1759,11 +1963,6 @@ const FILTERS = [
   { name: 'Duck', icon: '🦆', hint: 'Quack! Open your mouth', draw: duck },
   { name: 'Froggy', icon: '🐸', hint: 'Open your mouth!', draw: frog },
   { name: 'Googly Eyes', icon: '👀', hint: 'Wiggle!', draw: googly },
-  { name: 'Big Eyes', icon: '🥺', draw: bigEyes },
-  { name: 'Big Mouth', icon: '👄', hint: 'Say ahhh!', draw: bigMouth },
-  { name: 'Big Head', icon: '🤯', draw: bigHead },
-  { name: 'Stretchy', icon: '😮', draw: stretchy },
-  { name: 'Squishy', icon: '😆', draw: squishy },
   { name: 'Rainbow', icon: '🌈', hint: 'Open wide!', draw: rainbow },
   { name: 'Dragon', icon: '🐲', hint: 'Open wide for fire!', draw: dragon },
   { name: 'Bubble Gum', icon: '🍬', hint: 'Keep your mouth open!', draw: bubbleGum },
@@ -1803,11 +2002,19 @@ function drawScene(t, dt) {
   ctx.setTransform(V.dpr, 0, 0, V.dpr, 0, 0);
   ctx.clearRect(0, 0, V.W, V.H);
   if (!V.src || !V.sw) return;
-  ctx.save();
-  if (V.mirror) { ctx.translate(V.W, 0); ctx.scale(-1, 1); }
-  try { ctx.drawImage(V.src, V.dx, V.dy, V.dw, V.dh); } catch (e) {}
-  ctx.restore();
   const F = FILTERS[fi];
+  const warps = [];
+  if (F.warp) {
+    const add = (type, c, r, p0 = 0, p1 = 0, p2 = 0) => { if (warps.length < MAX_WARPS) warps.push([type, c.x, c.y, r, p0, p1, p2]); };
+    for (const tr of tracks) { try { F.warp(makeFace(tr.pts), add, t, tr.st); } catch (e) { console.error(e); } }
+  }
+  if (!(warps.length && drawWarped(warps))) {
+    ctx.save();
+    if (V.mirror) { ctx.translate(V.W, 0); ctx.scale(-1, 1); }
+    try { ctx.drawImage(V.src, V.dx, V.dy, V.dw, V.dh); } catch (e) {}
+    ctx.restore();
+    if (warps.length) approxWarps(warps);
+  }
   if (F.draw) for (const tr of tracks) {
     ctx.save();
     try { F.draw(makeFace(tr.pts), tr.st, t, dt); } catch (e) { console.error(e); }
